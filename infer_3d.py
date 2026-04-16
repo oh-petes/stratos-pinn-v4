@@ -1,9 +1,9 @@
 """
-infer_3d.py — Stratos PINN v3  |  Standalone Inference & VTP Export
+infer_3d.py — Stratos PINN v4  |  Standalone Inference & VTP Export
 =====================================================================
 Loads trained FourierFeatureNet weights, samples the 3D temperature
-field at a set of time snapshots, and writes one .vtp file per snapshot
-for visualization in ParaView.
+field inside the Hollow Elliptical Cone Shell at a set of time snapshots,
+and writes one .vtp file per snapshot for visualization in ParaView.
 
 Zero physicsnemo / hydra dependency — runs anywhere PyTorch + pyvista
 are installed.
@@ -16,7 +16,7 @@ Usage
 Checkpoint search order
 -----------------------
 1. outputs/models/best_weights_*.pth   (BestWeightSolver format)
-   payload: {"states": {"heat_network": <state_dict>}, "step": N, "loss": L}
+   payload: {"states": {"heat_network": <state_dict>}, "step": N}
 2. outputs/networks/heat_network.0.pth (PhysicsNeMo native, plain state dict)
 
 Output
@@ -25,8 +25,8 @@ Output
     outputs/inference/T_field_t005.0s.vtp
     ...  (one file per TIME_SNAPSHOTS entry)
 
-Each .vtp is a pyvista PolyData cloud of ~196 k points covering the
-cylinder interior with point arrays:
+Each .vtp is a pyvista PolyData cloud covering the cone shell interior
+with point arrays:
     T_K  — temperature in Kelvin
     T_C  — temperature in Celsius
 """
@@ -60,20 +60,28 @@ except ImportError:
 # 1.  PHYSICAL & NORMALIZATION CONSTANTS  (mirror of train_3d.py)
 # =============================================================================
 
-RADIUS    = 0.05          # m   — cylinder radius
-HEIGHT    = 0.10          # m   — cylinder height (z-axis)
-ALPHA     = 5e-6          # m²/s — thermal diffusivity
-T_END     = 60.0          # s   — simulation end time
+# Hollow Elliptical Cone Shell geometry
+A_BASE   = 0.06    # m  — semi-major axis (x) at z=Z_BOTTOM
+B_BASE   = 0.04    # m  — semi-minor axis (y) at z=Z_BOTTOM
+H_CONE   = 0.10    # m  — cone height; apex at z=H_CONE
+T_WALL   = 0.005   # m  — wall thickness (semi-axis reduction)
+Z_BOTTOM = 0.0     # m  — cone base
+Z_TOP    = 0.10    # m  — cone apex
+A_INNER  = A_BASE  - T_WALL   # 0.055 m
+B_INNER  = B_BASE  - T_WALL   # 0.035 m
 
-T_INITIAL = 300.0         # K   — initial condition / ambient
-T_PLASMA  = 4000.0        # K   — front-face Dirichlet BC
+ALPHA     = 5e-6   # m²/s — thermal diffusivity
+T_END     = 60.0   # s   — simulation end time
+
+T_INITIAL = 300.0
+T_PLASMA  = 4000.0
 T_RANGE   = T_PLASMA - T_INITIAL   # 3700 K
 
-# Min-max scaling to [0, 1] — must match train_3d.py exactly
-X_MIN,   X_SCALE  = -RADIUS, 2.0 * RADIUS   # [-0.05, 0.05] → [0, 1]
-Y_MIN,   Y_SCALE  = -RADIUS, 2.0 * RADIUS
-Z_MIN,   Z_SCALE  =  0.0,    HEIGHT          # [0.00, 0.10]  → [0, 1]
-T_MIN_T, T_SCALE  =  0.0,    T_END           # [0.0,  60.0]  → [0, 1]
+# Min-max normalization — must match train_3d.py exactly
+X_MIN,   X_SCALE = -A_BASE,   2.0 * A_BASE        # [-0.06, 0.06] → [0,1]
+Y_MIN,   Y_SCALE = -B_BASE,   2.0 * B_BASE        # [-0.04, 0.04] → [0,1]
+Z_MIN,   Z_SCALE =  Z_BOTTOM, Z_TOP - Z_BOTTOM    # [ 0.00, 0.10] → [0,1]
+T_MIN_T, T_SCALE =  0.0,      T_END               # [ 0.00, 60.0] → [0,1]
 
 # Time snapshots to export
 TIME_SNAPSHOTS = [0.0, 2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 40.0, 50.0, 60.0]  # seconds
@@ -86,22 +94,10 @@ TIME_SNAPSHOTS = [0.0, 2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 40.0, 50.0, 60.0]  # se
 class FourierFeatureNet(nn.Module):
     """
     Random Fourier feature encoding + SiLU fully-connected backbone.
-
     Intentionally identical to the FourierFeatureNet class in train_3d.py
-    except that it inherits from nn.Module instead of physicsnemo.sym.Arch.
-    The Arch base class contributes zero extra parameters or buffers, so the
-    state_dict keys are identical and checkpoints load without any key remapping.
-
-    Architecture
-    ------------
-    1.  Fixed random Fourier projection:
-            x_enc = [sin(x @ B), cos(x @ B)]   — not learned
-            B ~ N(0, freq_scale²),  shape (n_inputs=4, n_frequencies)
-    2.  nr_layers × (WeightNorm(Linear) → SiLU)
-    3.  Final Linear (no weight norm, no activation)
-
-    I/O convention (matches PhysicsNeMo Node evaluate signature):
-        forward(in_vars: dict[str, Tensor(batch, 1)]) → dict[str, Tensor(batch, 1)]
+    except inheriting from nn.Module instead of physicsnemo.sym.Arch.
+    The Arch base class contributes zero extra parameters or buffers so the
+    state_dict keys are identical and checkpoints load without key remapping.
     """
 
     _IN_KEYS  = ["x_hat", "y_hat", "z_hat", "t_hat"]
@@ -115,15 +111,13 @@ class FourierFeatureNet(nn.Module):
         freq_scale:    float = 1.0,
     ):
         super().__init__()
-        n_in  = len(self._IN_KEYS)    # 4
-        n_out = len(self._OUT_KEYS)   # 1
+        n_in  = len(self._IN_KEYS)
+        n_out = len(self._OUT_KEYS)
 
-        # Fixed Fourier projection matrix (registered as buffer → saved in state_dict)
         B = torch.randn(n_in, n_frequencies) * freq_scale
         self.register_buffer("_B", B)
 
-        enc_dim = 2 * n_frequencies   # sin + cos concatenated
-
+        enc_dim = 2 * n_frequencies
         layers: list[nn.Module] = []
         in_dim = enc_dim
         for _ in range(nr_layers):
@@ -131,17 +125,14 @@ class FourierFeatureNet(nn.Module):
             lin = nn.utils.weight_norm(lin)
             layers += [lin, nn.SiLU()]
             in_dim = layer_size
-        layers.append(nn.Linear(layer_size, n_out))  # no weight-norm on final layer
-
+        layers.append(nn.Linear(layer_size, n_out))
         self.net = nn.Sequential(*layers)
 
     def forward(self, in_vars: dict) -> dict:
-        # Stack inputs along feature dim → (batch, 4)
         x = torch.cat([in_vars[k] for k in self._IN_KEYS], dim=-1)
-        # Fourier encoding → (batch, 2*n_frequencies)
         x_proj = x @ self._B
         x_enc  = torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
-        out = self.net(x_enc)   # (batch, 1)
+        out = self.net(x_enc)
         return {k: out[:, i : i + 1] for i, k in enumerate(self._OUT_KEYS)}
 
 
@@ -159,21 +150,25 @@ def load_network(device: torch.device, explicit_ckpt: str = None) -> FourierFeat
     """
     net = FourierFeatureNet().to(device)
 
-    # --- Explicit path override -------------------------------------------------
     if explicit_ckpt:
         if not os.path.exists(explicit_ckpt):
             raise FileNotFoundError(f"Checkpoint not found: {explicit_ckpt}")
         _load_state_dict(net, explicit_ckpt, label="explicit")
         return net
 
-    # --- Priority 1: BestWeightSolver best_weights_*.pth -----------------------
-    best_files = sorted(glob.glob(os.path.join("outputs", "models", "best_weights_*.pth")))
-    if best_files:
-        best_file = best_files[-1]    # highest step number = most recent best
-        _load_state_dict(net, best_file, label="best")
+    # Priority 1: canonical best-weights file (BestWeightSolver — all-time best loss)
+    canonical = os.path.join("outputs", "models", "best_weights.pth")
+    if os.path.exists(canonical):
+        _load_state_dict(net, canonical, label="best")
         return net
 
-    # --- Priority 2: PhysicsNeMo native network checkpoint --------------------
+    # Priority 2: step-numbered best-weights files (older format fallback)
+    step_files = sorted(glob.glob(os.path.join("outputs", "models", "best_weights_step_*.pth")))
+    if step_files:
+        _load_state_dict(net, step_files[-1], label="best-step")
+        return net
+
+    # Priority 3: PhysicsNeMo native checkpoint
     native = os.path.join("outputs", "networks", "heat_network.0.pth")
     if os.path.exists(native):
         _load_state_dict(net, native, label="native")
@@ -181,35 +176,28 @@ def load_network(device: torch.device, explicit_ckpt: str = None) -> FourierFeat
 
     raise FileNotFoundError(
         "No checkpoint found.  Looked in:\n"
-        "  outputs/models/best_weights_*.pth\n"
+        "  outputs/models/best_weights.pth\n"
+        "  outputs/models/best_weights_step_*.pth\n"
         "  outputs/networks/heat_network.0.pth\n"
         "Run train_3d.py first, or pass --ckpt <path>."
     )
 
 
 def _load_state_dict(net: FourierFeatureNet, path: str, label: str) -> None:
-    """Load state dict from path, handling both checkpoint formats."""
     raw = torch.load(path, map_location="cpu")
-
-    # BestWeightSolver format: {"states": {"heat_network": <sd>}, "step": N}
     if isinstance(raw, dict) and "states" in raw:
-        sd = raw["states"]["heat_network"]
+        sd   = raw["states"]["heat_network"]
         step = raw.get("step", "?")
         loss = raw.get("loss", None)
         loss_str = f"  loss={loss:.4e}" if loss is not None else ""
         print(f"[{label}] Loaded weights  step={step}{loss_str}")
         print(f"         File: {os.path.basename(path)}")
-
-    # Plain state dict (PhysicsNeMo native) or wrapper with 'state_dict' key
     elif isinstance(raw, dict) and "state_dict" in raw:
         sd = raw["state_dict"]
         print(f"[{label}] Loaded wrapped state dict from {os.path.basename(path)}")
-
     else:
-        # Assume raw IS the state dict
         sd = raw
         print(f"[{label}] Loaded state dict from {os.path.basename(path)}")
-
     net.load_state_dict(sd)
 
 
@@ -217,31 +205,49 @@ def _load_state_dict(net: FourierFeatureNet, path: str, label: str) -> None:
 # 4.  3D GRID CONSTRUCTION
 # =============================================================================
 
-def build_cylinder_grid(
-    nx: int = 50,
-    ny: int = 50,
+def build_cone_shell_grid(
+    nx: int = 60,
+    ny: int = 40,
     nz: int = 100,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Build a Cartesian grid inside the cylinder (x²+y² ≤ RADIUS²).
+    Build a Cartesian grid inside the hollow elliptical cone shell.
+
+    Grid density:
+      nx=60, ny=40, nz=100 → 240 k pre-mask, ~12 k post-mask (shell is thin).
+      nz=100 over 10 cm = 1 mm z-resolution, resolving the ~1.7 cm thermal
+      penetration depth with ~17 points inside the thermally active zone.
+
+    Shell condition at each (x, y, z):
+      inside outer ellipse  AND  outside inner ellipse  AND  z in [Z_BOTTOM, Z_TOP]
+
+    Parameters
+    ----------
+    nx, ny, nz : grid resolution along each axis.
 
     Returns
     -------
-    x_pts, y_pts, z_pts : np.ndarray of shape (N_pts,), dtype float32
-        Physical coordinates of all interior points.
-
-    Grid density rationale
-    ----------------------
-    nx=ny=50, nz=100  →  50×50×100 = 250 k pre-mask, ~196 k post-mask.
-    100 z-steps over 10 cm = 1 mm z-resolution, enough to resolve the
-    1.7 cm thermal penetration depth with ~17 points inside the active zone.
+    x_pts, y_pts, z_pts : float32 arrays of shape (N_pts,)
+        Physical coordinates of all shell-interior points.
     """
-    xs = np.linspace(-RADIUS, RADIUS, nx, dtype=np.float32)
-    ys = np.linspace(-RADIUS, RADIUS, ny, dtype=np.float32)
-    zs = np.linspace(0.0,     HEIGHT, nz, dtype=np.float32)
+    xs = np.linspace(-A_BASE,   A_BASE,   nx, dtype=np.float32)
+    ys = np.linspace(-B_BASE,   B_BASE,   ny, dtype=np.float32)
+    zs = np.linspace(Z_BOTTOM,  Z_TOP,    nz, dtype=np.float32)
 
-    XX, YY, ZZ = np.meshgrid(xs, ys, zs, indexing="ij")  # (nx, ny, nz)
-    mask = (XX**2 + YY**2) <= RADIUS**2                   # cylinder mask
+    XX, YY, ZZ = np.meshgrid(xs, ys, zs, indexing="ij")   # (nx, ny, nz)
+
+    # Taper scale at each z: 1.0 at Z_BOTTOM, 0.0 at H_CONE
+    s = (H_CONE - ZZ) / (H_CONE - Z_BOTTOM)
+    s = np.maximum(s, 1e-9)   # guard near apex
+
+    a_out = A_BASE  * s
+    b_out = B_BASE  * s
+    a_in  = A_INNER * s
+    b_in  = B_INNER * s
+
+    outer_mask = (XX**2 / a_out**2 + YY**2 / b_out**2) <= 1.0
+    inner_mask = (XX**2 / a_in**2  + YY**2 / b_in**2)  >= 1.0
+    mask = outer_mask & inner_mask
 
     return XX[mask].ravel(), YY[mask].ravel(), ZZ[mask].ravel()
 
@@ -251,12 +257,12 @@ def build_cylinder_grid(
 # =============================================================================
 
 def infer_temperature(
-    net:       FourierFeatureNet,
-    x_pts:     np.ndarray,
-    y_pts:     np.ndarray,
-    z_pts:     np.ndarray,
-    t_phys:    float,
-    device:    torch.device,
+    net:        FourierFeatureNet,
+    x_pts:      np.ndarray,
+    y_pts:      np.ndarray,
+    z_pts:      np.ndarray,
+    t_phys:     float,
+    device:     torch.device,
     batch_size: int = 10_000,
 ) -> np.ndarray:
     """
@@ -268,7 +274,6 @@ def infer_temperature(
     """
     n = len(x_pts)
 
-    # Normalize inputs
     x_hat = (x_pts - X_MIN)   / X_SCALE
     y_hat = (y_pts - Y_MIN)   / Y_SCALE
     z_hat = (z_pts - Z_MIN)   / Z_SCALE
@@ -284,11 +289,11 @@ def infer_temperature(
                 key: torch.from_numpy(arr[sl, np.newaxis]).to(device)
                 for key, arr in zip(
                     ["x_hat", "y_hat", "z_hat", "t_hat"],
-                    [ x_hat,   y_hat,   z_hat,   t_hat ],
+                    [ x_hat,   y_hat,   z_hat,   t_hat],
                 )
             }
             T_hat = net(inp)["T_hat"].cpu().numpy().ravel()
-            T_out[sl] = T_hat * T_RANGE + T_INITIAL  # denormalize → Kelvin
+            T_out[sl] = T_hat * T_RANGE + T_INITIAL
 
     return T_out
 
@@ -309,30 +314,39 @@ def print_sanity_checks(
 
     Expected outcomes (well-trained network)
     -----------------------------------------
-    IC (t=0)      mean T ≈  300 K ± 20  (initial condition satisfied)
-    Front (z≈0, t=60)  mean T ≈ 4000 K ± 50  (Dirichlet BC satisfied)
+    IC (t=0)     : mean T ≈  300 K ± 20  (initial condition satisfied)
+    Outer wall (t=60): T ≈ 4000 K near outer surface (Dirichlet BC satisfied)
     Penetration depth at t=60 s: √(α·t) ≈ 1.73 cm  (analytical reference)
     """
     print("\n── Sanity checks ────────────────────────────────────────────────")
 
-    # 1) Initial condition: t=0, all points
+    # 1) Initial condition: t=0, all interior points
     T0 = infer_temperature(net, x_pts, y_pts, z_pts, 0.0, device)
     ic_ok = "✓" if abs(T0.mean() - T_INITIAL) < 20 else "✗"
     print(f"  {ic_ok}  IC   (t=0)       mean T = {T0.mean():.1f} K   (expected ~{T_INITIAL:.0f} K)")
 
-    # 2) Front-face Dirichlet BC: z ≈ 0, t=60
-    front_mask = z_pts < (HEIGHT / 100.0 / 2)   # first half z-step
-    if front_mask.sum() > 0:
-        T60f = infer_temperature(
-            net, x_pts[front_mask], y_pts[front_mask], z_pts[front_mask], 60.0, device
+    # 2) Outer wall Dirichlet BC: sample points near the outer cone surface at t=60.
+    # Proxy: points close to the outer ellipse (normalized radius ≈ 1) at mid-z.
+    s_pts = (H_CONE - z_pts) / (H_CONE - Z_BOTTOM)
+    s_pts = np.maximum(s_pts, 1e-9)
+    a_out_pts = A_BASE * s_pts
+    b_out_pts = B_BASE * s_pts
+    ellipse_val = x_pts**2 / a_out_pts**2 + y_pts**2 / b_out_pts**2
+    outer_mask = ellipse_val >= 0.90   # within ~5% of outer surface
+    if outer_mask.sum() > 0:
+        T60w = infer_temperature(
+            net, x_pts[outer_mask], y_pts[outer_mask], z_pts[outer_mask], 60.0, device
         )
-        bc_ok = "✓" if abs(T60f.mean() - T_PLASMA) < 100 else "✗"
-        print(f"  {bc_ok}  Front BC (z≈0, t=60)  mean T = {T60f.mean():.1f} K   (expected ~{T_PLASMA:.0f} K)")
+        bc_ok = "✓" if abs(T60w.mean() - T_PLASMA) < 200 else "✗"
+        print(
+            f"  {bc_ok}  Outer wall (near-surface, t=60)  mean T = {T60w.mean():.1f} K"
+            f"   (expected ~{T_PLASMA:.0f} K)"
+        )
     else:
-        print("  ?  Front face slice is empty — check grid resolution")
+        print("  ?  No near-surface points found — check grid resolution")
 
-    # 3) Analytical penetration depth (reference only)
-    delta_cm = math.sqrt(ALPHA * T_END) * 100   # √(αt) in cm
+    # 3) Analytical penetration depth (reference)
+    delta_cm = math.sqrt(ALPHA * T_END) * 100
     print(f"  ℹ  Analytical penetration depth at t=60 s: {delta_cm:.2f} cm (~1.7 cm)")
     print("─────────────────────────────────────────────────────────────────\n")
 
@@ -356,15 +370,14 @@ def export_snapshots(
       2. Build pyvista.PolyData with point arrays T_K and T_C
       3. Save as .vtp
 
-    Resulting files can be loaded together in ParaView as a temporal series
-    and animated or used with a threshold filter to visualise penetration depth.
+    Results can be loaded together in ParaView as a temporal series.
     """
     if not _PYVISTA_OK:
         print("pyvista not available — skipping VTP export.")
         return
 
     os.makedirs(out_dir, exist_ok=True)
-    points = np.column_stack([x_pts, y_pts, z_pts]).astype(np.float32)  # (N, 3)
+    points = np.column_stack([x_pts, y_pts, z_pts]).astype(np.float32)
 
     print(f"Exporting {len(TIME_SNAPSHOTS)} snapshots → {out_dir}/")
     for t_s in TIME_SNAPSHOTS:
@@ -379,14 +392,11 @@ def export_snapshots(
         cloud.save(fname)
         print(f"  → {fname}   T ∈ [{T_K.min():.0f}, {T_K.max():.0f}] K")
 
-        # Also write the canonical Kaggle filename for the t=60s snapshot
         if t_s == 60.0:
-            alias = os.path.join(out_dir, "cylinder_heat_t60.vtp")
+            alias = os.path.join(out_dir, "cone_shell_heat_t60.vtp")
             shutil.copy2(fname, alias)
             print(f"  → {alias}  (alias)")
 
-    # Write a PVD file — ParaView opens this as a single time-aware dataset,
-    # enabling the Play button to animate through all snapshots automatically.
     pvd_path = os.path.join(out_dir, "heat_animation.pvd")
     with open(pvd_path, "w") as f:
         f.write('<?xml version="1.0"?>\n')
@@ -410,11 +420,11 @@ def export_snapshots(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Stratos PINN v3 — 3D inference & VTP export"
+        description="Stratos PINN v4 — Hollow Elliptical Cone Shell inference & VTP export"
     )
     p.add_argument(
         "--model_path",
-        default=os.path.join("outputs", "models", "best_weights_step_009000.pth"),
+        default=os.path.join("outputs", "models", "best_weights.pth"),
         metavar="PATH",
         help="Path to checkpoint .pth file (alias for --ckpt).",
     )
@@ -424,29 +434,20 @@ def parse_args() -> argparse.Namespace:
         metavar="PATH",
         help="Path to checkpoint .pth file (overrides --model_path default).",
     )
-    p.add_argument(
-        "--nx", type=int, default=50, help="Grid points along x (default 50)"
-    )
-    p.add_argument(
-        "--ny", type=int, default=50, help="Grid points along y (default 50)"
-    )
-    p.add_argument(
-        "--nz", type=int, default=100, help="Grid points along z (default 100)"
-    )
+    p.add_argument("--nx", type=int, default=60,  help="Grid points along x (default 60)")
+    p.add_argument("--ny", type=int, default=40,  help="Grid points along y (default 40)")
+    p.add_argument("--nz", type=int, default=100, help="Grid points along z (default 100)")
     p.add_argument(
         "--out_dir",
         default=os.path.join("outputs", "inference"),
         help="Output directory for .vtp files",
     )
     p.add_argument(
-        "--batch_size",
-        type=int,
-        default=10_000,
+        "--batch_size", type=int, default=10_000,
         help="Inference mini-batch size (default 10000)",
     )
     p.add_argument(
-        "--cpu",
-        action="store_true",
+        "--cpu", action="store_true",
         help="Force CPU inference even if CUDA is available",
     )
     return p.parse_args()
@@ -455,26 +456,23 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    # --- Device ------------------------------------------------------------------
-    if args.cpu:
-        device = torch.device("cpu")
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu") if args.cpu else torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
     print(f"Device : {device}")
 
-    # --- Load network ------------------------------------------------------------
-    explicit_ckpt = args.model_path or args.ckpt
+    explicit_ckpt = args.ckpt or args.model_path
     net = load_network(device, explicit_ckpt=explicit_ckpt)
 
-    # --- Build grid --------------------------------------------------------------
-    x_pts, y_pts, z_pts = build_cylinder_grid(nx=args.nx, ny=args.ny, nz=args.nz)
+    x_pts, y_pts, z_pts = build_cone_shell_grid(nx=args.nx, ny=args.ny, nz=args.nz)
     n_pts = len(x_pts)
-    print(f"Grid   : {args.nx}×{args.ny}×{args.nz} pre-mask → {n_pts:,} points inside cylinder")
+    print(
+        f"Grid   : {args.nx}×{args.ny}×{args.nz} pre-mask → {n_pts:,} points inside cone shell"
+        f"  (A={A_BASE}m, B={B_BASE}m, H={H_CONE}m, wall={T_WALL}m)"
+    )
 
-    # --- Sanity checks (uses first & last snapshot) ------------------------------
     print_sanity_checks(net, x_pts, y_pts, z_pts, device)
 
-    # --- Export VTP snapshots ----------------------------------------------------
     export_snapshots(
         net, x_pts, y_pts, z_pts, device,
         out_dir=args.out_dir,
