@@ -156,16 +156,10 @@ def load_network(device: torch.device, explicit_ckpt: str = None) -> FourierFeat
         _load_state_dict(net, explicit_ckpt, label="explicit")
         return net
 
-    # Priority 1: canonical best-weights file (BestWeightSolver — all-time best loss)
-    canonical = os.path.join("outputs", "models", "best_weights.pth")
-    if os.path.exists(canonical):
-        _load_state_dict(net, canonical, label="best")
-        return net
-
-    # Priority 2: step-numbered best-weights files (older format fallback)
+    # Priority 1: single best-weights file (BestWeightSolver — only one exists at a time)
     step_files = sorted(glob.glob(os.path.join("outputs", "models", "best_weights_step_*.pth")))
     if step_files:
-        _load_state_dict(net, step_files[-1], label="best-step")
+        _load_state_dict(net, step_files[-1], label="best")
         return net
 
     # Priority 3: PhysicsNeMo native checkpoint
@@ -176,7 +170,6 @@ def load_network(device: torch.device, explicit_ckpt: str = None) -> FourierFeat
 
     raise FileNotFoundError(
         "No checkpoint found.  Looked in:\n"
-        "  outputs/models/best_weights.pth\n"
         "  outputs/models/best_weights_step_*.pth\n"
         "  outputs/networks/heat_network.0.pth\n"
         "Run train_3d.py first, or pass --ckpt <path>."
@@ -424,7 +417,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--model_path",
-        default=os.path.join("outputs", "models", "best_weights.pth"),
+        default=None,
         metavar="PATH",
         help="Path to checkpoint .pth file (alias for --ckpt).",
     )

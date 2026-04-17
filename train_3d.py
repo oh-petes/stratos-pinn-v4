@@ -470,53 +470,52 @@ class FourierFeatureNet(Arch):
 
 class BestWeightSolver(Solver):
     """
-    Solver subclass that saves network weights to outputs/models/best_weights.pth
-    only when the total training loss improves over the previous saved best.
+    Solver subclass that saves network weights only when the loss strictly
+    improves, checked every 100 steps (save_network_freq=100).
 
-    Design
-    ------
-    save_network_freq is set to 100 so PhysicsNeMo calls save_checkpoint every
-    100 steps.  At each call we compare the current loss against _best_loss and
-    only write to disk when it strictly improves.  A single canonical file
-    (best_weights.pth) holds the all-time best; a step-numbered copy is kept
-    alongside it for debugging, with the last _KEEP_LAST copies retained.
+    At any given moment exactly ONE file exists in outputs/models/:
+        best_weights_step_NNNNNN.pth   — the all-time best weights so far
+
+    When a new best is found:
+      1. Delete the previous best file (safe no-op if it has already gone).
+      2. Write the new file with the current step number.
 
     Loss capture
     ------------
-    compute_gradients() is overridden at the class level (not dynamically
-    post-__init__) so PhysicsNeMo's training loop always calls our version.
-    The override records the scalar loss then delegates to super().
+    compute_gradients() is overridden at the class level so the training loop
+    always reaches this method regardless of how PhysicsNeMo caches callables.
 
     Resume behaviour
     ----------------
-    On construction we reload _best_loss from the existing best_weights.pth if
-    present, so a resumed run will not overwrite a genuinely better checkpoint
-    from a previous session.
+    On construction we scan outputs/models/ for any existing best_weights_step_*
+    file and restore its loss, so a resumed run will not overwrite a genuinely
+    better checkpoint from a previous session.
 
-    File format
-    -----------
-    best_weights.pth
-    best_weights_step_NNNNNN.pth   (step-numbered copies, last _KEEP_LAST kept)
-    payload: {"states": {"heat_network": <state_dict>}, "step": N, "loss": L}
+    File payload
+    ------------
+    {"states": {"heat_network": <state_dict>}, "step": N, "loss": L}
     """
 
-    _BEST_DIR:  str = os.path.join("outputs", "models")
-    _BEST_FILE: str = os.path.join("outputs", "models", "best_weights.pth")
-    _KEEP_LAST: int = 3
+    _BEST_DIR: str = os.path.join("outputs", "models")
 
     def __init__(self, cfg: "SimConfig", domain: Domain) -> None:
         os.makedirs(self._BEST_DIR, exist_ok=True)
         self._best_loss: float = float("inf")
         self._step_loss: float = float("inf")
+        self._best_file: str   = ""          # path of the currently-saved best file
 
-        # Restore prior best loss so a resumed run doesn't blindly overwrite
-        if os.path.exists(self._BEST_FILE):
+        # Restore prior best so a resumed run doesn't overwrite a better checkpoint
+        existing = sorted(
+            glob.glob(os.path.join(self._BEST_DIR, "best_weights_step_*.pth"))
+        )
+        if existing:
             try:
-                ckpt = torch.load(self._BEST_FILE, map_location="cpu")
+                ckpt = torch.load(existing[-1], map_location="cpu")
                 self._best_loss = float(ckpt.get("loss", float("inf")))
+                self._best_file = existing[-1]
                 print(
                     f"  ℹ  Restored best loss = {self._best_loss:.4e}"
-                    f"  (step {ckpt.get('step', '?')})"
+                    f"  from {os.path.basename(existing[-1])}"
                 )
             except Exception:
                 pass
@@ -524,8 +523,7 @@ class BestWeightSolver(Solver):
         super().__init__(cfg, domain)
 
     # ------------------------------------------------------------------
-    # Loss capture — class-level override so the training loop always
-    # reaches this method regardless of how PhysicsNeMo caches callables.
+    # Loss capture
     # ------------------------------------------------------------------
     def compute_gradients(self):
         loss = super().compute_gradients()
@@ -537,7 +535,7 @@ class BestWeightSolver(Solver):
         return loss
 
     # ------------------------------------------------------------------
-    # Conditional checkpoint save
+    # Conditional checkpoint save — called every 100 steps
     # ------------------------------------------------------------------
     def save_checkpoint(self, step: int) -> None:
         # Always run the native PhysicsNeMo checkpoint (optimizer + scheduler state)
@@ -550,29 +548,28 @@ class BestWeightSolver(Solver):
         current_loss = self._step_loss
 
         if current_loss < self._best_loss:
+            # --- Delete the previous best file (single-file guarantee) -------
+            if self._best_file and os.path.exists(self._best_file):
+                try:
+                    os.remove(self._best_file)
+                except OSError:
+                    pass   # already gone — safe to continue
+
+            # --- Save new best ------------------------------------------------
             self._best_loss = current_loss
+            new_path = os.path.join(
+                self._BEST_DIR, f"best_weights_step_{step:06d}.pth"
+            )
             sd = torch.load(native, map_location="cpu")
-            payload = {"states": {"heat_network": sd}, "step": step, "loss": current_loss}
-
-            # Canonical best file (always the all-time best)
-            torch.save(payload, self._BEST_FILE)
-
-            # Step-numbered copy for debugging / rollback
-            step_path = os.path.join(self._BEST_DIR, f"best_weights_step_{step:06d}.pth")
-            torch.save(payload, step_path)
-
+            torch.save(
+                {"states": {"heat_network": sd}, "step": step, "loss": current_loss},
+                new_path,
+            )
+            self._best_file = new_path
             print(
                 f"\n  ✓ New best  step={step:6d}  loss={current_loss:.4e}"
-                f"  → best_weights.pth"
+                f"  → {os.path.basename(new_path)}"
             )
-
-            # Prune old step-numbered copies; keep canonical file untouched
-            step_files = sorted(
-                glob.glob(os.path.join(self._BEST_DIR, "best_weights_step_*.pth"))
-            )
-            for old in step_files[: -self._KEEP_LAST]:
-                os.remove(old)
-                print(f"  ✗ Pruned  {os.path.basename(old)}")
         else:
             print(
                 f"\n  — Step {step:6d}  loss={current_loss:.4e}"
@@ -695,7 +692,7 @@ def run(cfg: SimConfig) -> None:
     # --- Training hyperparameters --------------------------------------------
     with open_dict(cfg):
         cfg.training = OmegaConf.structured(DefaultTraining(
-            max_steps=50_000,
+            max_steps=20_000,
             save_network_freq=100,   # check for best weights every 100 steps
             print_stats_freq=100,
             summary_freq=1_000,
