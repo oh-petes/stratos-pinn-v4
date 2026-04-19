@@ -92,7 +92,7 @@ from physicsnemo.sym.domain.constraint import (
 from physicsnemo.sym.node import Node
 from physicsnemo.sym.key import Key
 from physicsnemo.sym.eq.pde import PDE
-from physicsnemo.sym.models.arch import Arch, FuncArch
+from physicsnemo.sym.models.arch import Arch
 
 from physicsnemo.sym.hydra.config import PhysicsNeMoConfig
 from physicsnemo.sym.hydra.training import DefaultTraining, DefaultStopCriterion
@@ -488,7 +488,7 @@ class BottomAnnularLip:
 # The base class handles dict ↔ tensor conversion and efficient torch.func
 # Jacobian/Hessian computation used by the PDE residual nodes.
 
-class FourierFeatureNet(FuncArch):
+class FourierFeatureNet(Arch):
     """
     Fourier-feature MLP implementing the FuncArch interface.
 
