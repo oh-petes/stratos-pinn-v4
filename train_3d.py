@@ -92,7 +92,7 @@ from physicsnemo.sym.domain.constraint import (
 from physicsnemo.sym.node import Node
 from physicsnemo.sym.key import Key
 from physicsnemo.sym.eq.pde import PDE
-from physicsnemo.sym.models.fully_connected import FullyConnectedArch
+from physicsnemo.sym.models.arch import Arch, FuncArch
 
 from physicsnemo.sym.hydra.config import PhysicsNeMoConfig
 from physicsnemo.sym.hydra.training import DefaultTraining, DefaultStopCriterion
@@ -476,10 +476,60 @@ class BottomAnnularLip:
         return result
 
 
-# Network architecture is PhysicsNeMo's built-in FullyConnectedArch.
-# Using the native arch is required for FuncArch support — without it
-# PhysicsNeMo falls back to a slow graph-tracing path that can hang
-# indefinitely when building second-order derivative graphs at startup.
+# =============================================================================
+# NETWORK ARCHITECTURE
+# =============================================================================
+# FuncArch subclass — required for the fast symbolic Jacobian/Hessian path.
+# Without FuncArch, PhysicsNeMo traces second-order derivative graphs with
+# repeated eager autograd passes at startup, which hangs on large networks.
+#
+# FuncArch contract: implement _tensor_forward(x) where x is the
+# concatenated input tensor (n, n_inputs) → output tensor (n, n_outputs).
+# The base class handles dict ↔ tensor conversion and efficient torch.func
+# Jacobian/Hessian computation used by the PDE residual nodes.
+
+class FourierFeatureNet(FuncArch):
+    """
+    Fourier-feature MLP implementing the FuncArch interface.
+
+    Architecture
+    ------------
+    1. Random Fourier projection: [sin(Bx), cos(Bx)]  (fixed, not learned)
+       B ~ N(0, freq_scale²),  shape (n_inputs, n_frequencies)
+    2. nr_layers × (Linear → SiLU)
+    3. Final linear projection to n_outputs
+    """
+
+    def __init__(
+        self,
+        input_keys:    list,
+        output_keys:   list,
+        layer_size:    int   = 256,
+        nr_layers:     int   = 6,
+        n_frequencies: int   = 8,
+        freq_scale:    float = 1.0,
+    ):
+        super().__init__(input_keys=input_keys, output_keys=output_keys)
+        n_in  = len(input_keys)
+        n_out = len(output_keys)
+
+        B = torch.randn(n_in, n_frequencies) * freq_scale
+        self.register_buffer("_B", B)
+
+        enc_dim = 2 * n_frequencies
+        layers: list = []
+        in_dim = enc_dim
+        for _ in range(nr_layers):
+            layers += [torch.nn.Linear(in_dim, layer_size), torch.nn.SiLU()]
+            in_dim = layer_size
+        layers.append(torch.nn.Linear(layer_size, n_out))
+        self.net = torch.nn.Sequential(*layers)
+
+    def _tensor_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """FuncArch contract: (n, n_in) → (n, n_out)."""
+        x_proj = x @ self._B
+        x_enc  = torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
+        return self.net(x_enc)
 
 
 # =============================================================================
@@ -799,25 +849,29 @@ def _run_inner(cfg: SimConfig) -> None:
     # -------------------------------------------------------------------------
     # 4.3  Network Architecture
     # -------------------------------------------------------------------------
-    # FullyConnectedArch is PhysicsNeMo's native MLP — it supports FuncArch,
-    # enabling fast symbolic graph construction and GPU compilation at startup.
-    network = FullyConnectedArch(
+    print("[setup] Building network …", flush=True)
+    network = FourierFeatureNet(
         input_keys=[Key("x_hat"), Key("y_hat"), Key("z_hat"), Key("t_hat")],
         output_keys=[Key("T_hat")],
         layer_size=256,
         nr_layers=6,
+        n_frequencies=8,
+        freq_scale=1.0,
     )
     network_node = network.make_node(name="heat_network", jit=False)
+    print("[setup] Network node ready.", flush=True)
 
     # -------------------------------------------------------------------------
     # 4.4  PDE Nodes
     # -------------------------------------------------------------------------
+    print("[setup] Building PDE nodes …", flush=True)
     heat_pde  = NormalizedHeatEquation3D(
         alpha_x_hat=ALPHA_X_HAT,
         alpha_y_hat=ALPHA_Y_HAT,
         alpha_z_hat=ALPHA_Z_HAT,
     )
     pde_nodes = heat_pde.make_nodes()
+    print("[setup] PDE nodes ready.", flush=True)
 
     # -------------------------------------------------------------------------
     # 4.5  Full Node Graph
@@ -836,8 +890,7 @@ def _run_inner(cfg: SimConfig) -> None:
     domain = Domain()
 
     # --- 1) Interior PDE constraint ------------------------------------------
-    # Enforces the normalized heat equation at 2000 collocation points per step
-    # throughout the cone shell volume × time domain.
+    print("[setup] Building interior_pde constraint …", flush=True)
     interior_pde = PointwiseInteriorConstraint(
         nodes=all_nodes,
         geometry=cone_shell,
@@ -854,13 +907,10 @@ def _run_inner(cfg: SimConfig) -> None:
         shuffle=True,
     )
     domain.add_constraint(interior_pde, name="interior_pde")
+    print("[setup] interior_pde done.", flush=True)
 
     # --- 2) Outer cone wall Dirichlet BC: T=4000 K, for t>0 ------------------
-    # Plasma-facing exterior slant surface.
-    # Weight=10: strong enforcement of the plasma temperature BC.
-    # t starts at 0.1 to avoid the t=0 discontinuity (IC=300K vs BC=4000K).
-    # OuterConeWall samples exclusively from the outer lateral surface —
-    # all batch_size=1000 points are on the plasma face.
+    print("[setup] Building bc_outer_dirichlet …", flush=True)
     outer_wall_bc = PointwiseBoundaryConstraint(
         nodes=all_nodes,
         geometry=outer_wall_geom,
@@ -870,9 +920,10 @@ def _run_inner(cfg: SimConfig) -> None:
         lambda_weighting={"T_hat": 10.0},
     )
     domain.add_constraint(outer_wall_bc, name="bc_outer_dirichlet")
+    print("[setup] bc_outer_dirichlet done.", flush=True)
 
     # --- 3) Inner cone wall Neumann BC: dT/dn=0 (adiabatic hollow cavity) ----
-    # Interior cavity wall — no heat flux into the void.
+    print("[setup] Building bc_inner_neumann …", flush=True)
     inner_wall_bc = PointwiseBoundaryConstraint(
         nodes=all_nodes,
         geometry=inner_wall_geom,
@@ -882,10 +933,12 @@ def _run_inner(cfg: SimConfig) -> None:
         lambda_weighting={"neumann_cone": 1.0},
     )
     domain.add_constraint(inner_wall_bc, name="bc_inner_neumann")
+    print("[setup] bc_inner_neumann done.", flush=True)
 
     # --- 4) Bottom annular lip Neumann BC: dT/dn=0 (adiabatic base edge) -----
     # Flat annular ring at z=Z_BOTTOM between inner and outer ellipses.
     # Normal = (0,0,-1); condition simplifies to dT_hat/dz_hat = 0.
+    print("[setup] Building bc_bottom_neumann …", flush=True)
     bottom_lip_bc = PointwiseBoundaryConstraint(
         nodes=all_nodes,
         geometry=bottom_lip_geom,
@@ -895,9 +948,10 @@ def _run_inner(cfg: SimConfig) -> None:
         lambda_weighting={"neumann_cone": 1.0},
     )
     domain.add_constraint(bottom_lip_bc, name="bc_bottom_neumann")
+    print("[setup] bc_bottom_neumann done.", flush=True)
 
     # --- 5) Initial condition: T=300 K everywhere at t=0 ---------------------
-    # T_hat target = (300 - 300) / 3700 = 0.0
+    print("[setup] Building ic_t0 constraint …", flush=True)
     initial_condition = PointwiseInteriorConstraint(
         nodes=all_nodes,
         geometry=cone_shell,
@@ -913,6 +967,7 @@ def _run_inner(cfg: SimConfig) -> None:
         fixed_dataset=False,
     )
     domain.add_constraint(initial_condition, name="ic_t0")
+    print("[setup] ic_t0 done.", flush=True)
 
     # -------------------------------------------------------------------------
     # 4.7  Inject Loss Config & Launch Solver
