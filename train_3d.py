@@ -595,13 +595,16 @@ class BestWeightSolver(Solver):
     # Loss capture
     # ------------------------------------------------------------------
     def compute_gradients(self):
-        loss = super().compute_gradients()
-        if loss is not None:
-            try:
-                self._step_loss = float(loss)
-            except Exception:
-                pass
-        return loss
+        # Trainer returns (aggregated_loss_tensor, per_constraint_losses_dict).
+        # We unpack defensively so this works if the return type ever changes.
+        result = super().compute_gradients()
+        try:
+            loss_val = result[0] if isinstance(result, (tuple, list)) else result
+            if loss_val is not None:
+                self._step_loss = float(loss_val)
+        except Exception:
+            pass
+        return result
 
     # ------------------------------------------------------------------
     # Conditional checkpoint save — called every 100 steps
@@ -615,6 +618,15 @@ class BestWeightSolver(Solver):
             return
 
         current_loss = self._step_loss
+
+        # Heartbeat every 500 steps — always printed to stdout so Kaggle
+        # shows the run is alive without flooding the cell output.
+        if step % 500 == 0:
+            print(
+                f"[step {step:6d}/{20000}]  loss={current_loss:.4e}"
+                f"  best={self._best_loss:.4e}",
+                flush=True,
+            )
 
         if current_loss < self._best_loss:
             # --- Delete the previous best file (single-file guarantee) -------
@@ -636,13 +648,9 @@ class BestWeightSolver(Solver):
             )
             self._best_file = new_path
             print(
-                f"\n  ✓ New best  step={step:6d}  loss={current_loss:.4e}"
-                f"  → {os.path.basename(new_path)}"
-            )
-        else:
-            print(
-                f"\n  — Step {step:6d}  loss={current_loss:.4e}"
-                f"  (best={self._best_loss:.4e} — not saved)"
+                f"  ✓ New best  step={step:6d}  loss={current_loss:.4e}"
+                f"  → {os.path.basename(new_path)}",
+                flush=True,
             )
 
 
