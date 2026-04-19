@@ -92,7 +92,7 @@ from physicsnemo.sym.domain.constraint import (
 from physicsnemo.sym.node import Node
 from physicsnemo.sym.key import Key
 from physicsnemo.sym.eq.pde import PDE
-from physicsnemo.sym.models.arch import Arch
+from physicsnemo.sym.models.fully_connected import FullyConnectedArch
 
 from physicsnemo.sym.hydra.config import PhysicsNeMoConfig
 from physicsnemo.sym.hydra.training import DefaultTraining, DefaultStopCriterion
@@ -476,61 +476,10 @@ class BottomAnnularLip:
         return result
 
 
-# =============================================================================
-# NETWORK ARCHITECTURE  (pure PyTorch — no physicsnemo.nn dependency)
-# =============================================================================
-
-class FourierFeatureNet(Arch):
-    """
-    Fourier-feature encoding + SiLU fully-connected backbone.
-
-    Inherits from Arch (physicsnemo.sym.models.arch.Arch) so that the
-    PhysicsNeMo Solver recognises this module as a trainable network and
-    correctly registers its parameters with the Adam optimizer.
-
-    Architecture
-    ____________
-    1.  Random Fourier projection: x_enc = [sin(Bx), cos(Bx)]  (fixed, not learned)
-        B ~ N(0, freq_scale²),  shape (n_inputs, n_frequencies)
-    2.  nr_layers × (Linear → SiLU) with weight normalization
-    3.  Final linear projection to n_outputs (no activation)
-    """
-
-    def __init__(
-        self,
-        input_keys:    list,
-        output_keys:   list,
-        layer_size:    int   = 256,
-        nr_layers:     int   = 6,
-        n_frequencies: int   = 8,
-        freq_scale:    float = 1.0,
-    ):
-        super().__init__(input_keys=input_keys, output_keys=output_keys)
-        self._in_keys  = [k.name for k in input_keys]
-        self._out_keys = [k.name for k in output_keys]
-        n_in  = len(input_keys)
-        n_out = len(output_keys)
-
-        B = torch.randn(n_in, n_frequencies) * freq_scale
-        self.register_buffer("_B", B)
-
-        enc_dim = 2 * n_frequencies
-        layers: list[torch.nn.Module] = []
-        in_dim = enc_dim
-        for _ in range(nr_layers):
-            lin = torch.nn.Linear(in_dim, layer_size)
-            lin = torch.nn.utils.weight_norm(lin)
-            layers += [lin, torch.nn.SiLU()]
-            in_dim = layer_size
-        layers.append(torch.nn.Linear(layer_size, n_out))
-        self.net = torch.nn.Sequential(*layers)
-
-    def forward(self, in_vars: dict) -> dict:
-        x = torch.cat([in_vars[k] for k in self._in_keys], dim=-1)
-        x_proj = x @ self._B
-        x_enc  = torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
-        out = self.net(x_enc)
-        return {k: out[:, i : i + 1] for i, k in enumerate(self._out_keys)}
+# Network architecture is PhysicsNeMo's built-in FullyConnectedArch.
+# Using the native arch is required for FuncArch support — without it
+# PhysicsNeMo falls back to a slow graph-tracing path that can hang
+# indefinitely when building second-order derivative graphs at startup.
 
 
 # =============================================================================
@@ -850,13 +799,13 @@ def _run_inner(cfg: SimConfig) -> None:
     # -------------------------------------------------------------------------
     # 4.3  Network Architecture
     # -------------------------------------------------------------------------
-    network = FourierFeatureNet(
+    # FullyConnectedArch is PhysicsNeMo's native MLP — it supports FuncArch,
+    # enabling fast symbolic graph construction and GPU compilation at startup.
+    network = FullyConnectedArch(
         input_keys=[Key("x_hat"), Key("y_hat"), Key("z_hat"), Key("t_hat")],
         output_keys=[Key("T_hat")],
         layer_size=256,
         nr_layers=6,
-        n_frequencies=8,
-        freq_scale=1.0,
     )
     network_node = network.make_node(name="heat_network", jit=False)
 
