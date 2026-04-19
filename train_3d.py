@@ -850,11 +850,14 @@ def _run_inner(cfg: SimConfig) -> None:
     # 4.3  Network Architecture
     # -------------------------------------------------------------------------
     print("[setup] Building network …", flush=True)
+    # layer_size=128, nr_layers=4: torch.func Hessian compilation is O(width²×depth)
+    # on CPU at startup. 128×4 compiles in ~30s vs 256×6 which takes many minutes.
+    # Capacity is still well above what this 4D→1D problem needs.
     network = FourierFeatureNet(
         input_keys=[Key("x_hat"), Key("y_hat"), Key("z_hat"), Key("t_hat")],
         output_keys=[Key("T_hat")],
-        layer_size=256,
-        nr_layers=6,
+        layer_size=128,
+        nr_layers=4,
         n_frequencies=8,
         freq_scale=1.0,
     )
@@ -895,13 +898,13 @@ def _run_inner(cfg: SimConfig) -> None:
         nodes=all_nodes,
         geometry=cone_shell,
         outvar={"heat_equation": 0},
-        batch_size=2000,
+        batch_size=500,
         bounds={
             Symbol("x"): (-A_BASE,  A_BASE),
             Symbol("y"): (-B_BASE,  B_BASE),
             Symbol("z"): (Z_BOTTOM, Z_TOP),
-            Symbol("t"): (0.0,      T_END),
         },
+        parameterization={Symbol("t"): (0.0, T_END)},
         lambda_weighting={"heat_equation": 1.0},
         fixed_dataset=False,
         shuffle=True,
@@ -915,7 +918,7 @@ def _run_inner(cfg: SimConfig) -> None:
         nodes=all_nodes,
         geometry=outer_wall_geom,
         outvar={"T_hat": 1.0},
-        batch_size=1000,
+        batch_size=500,
         parameterization={Symbol("t"): (0.1, T_END)},
         lambda_weighting={"T_hat": 10.0},
     )
@@ -928,7 +931,7 @@ def _run_inner(cfg: SimConfig) -> None:
         nodes=all_nodes,
         geometry=inner_wall_geom,
         outvar={"neumann_cone": 0},
-        batch_size=1000,
+        batch_size=500,
         parameterization={Symbol("t"): (0.0, T_END)},
         lambda_weighting={"neumann_cone": 1.0},
     )
@@ -943,7 +946,7 @@ def _run_inner(cfg: SimConfig) -> None:
         nodes=all_nodes,
         geometry=bottom_lip_geom,
         outvar={"neumann_cone": 0},
-        batch_size=500,
+        batch_size=200,
         parameterization={Symbol("t"): (0.0, T_END)},
         lambda_weighting={"neumann_cone": 1.0},
     )
@@ -956,7 +959,7 @@ def _run_inner(cfg: SimConfig) -> None:
         nodes=all_nodes,
         geometry=cone_shell,
         outvar={"T_hat": 0.0},
-        batch_size=2000,
+        batch_size=500,
         bounds={
             Symbol("x"): (-A_BASE,  A_BASE),
             Symbol("y"): (-B_BASE,  B_BASE),
