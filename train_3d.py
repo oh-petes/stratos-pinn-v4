@@ -510,6 +510,8 @@ class FourierFeatureNet(Arch):
         freq_scale:    float = 1.0,
     ):
         super().__init__(input_keys=input_keys, output_keys=output_keys)
+        self._in_keys  = [k.name for k in input_keys]
+        self._out_keys = [k.name for k in output_keys]
         n_in  = len(input_keys)
         n_out = len(output_keys)
 
@@ -526,10 +528,16 @@ class FourierFeatureNet(Arch):
         self.net = torch.nn.Sequential(*layers)
 
     def _tensor_forward(self, x: torch.Tensor) -> torch.Tensor:
-        """FuncArch contract: (n, n_in) → (n, n_out)."""
+        """FuncArch contract (n, n_in) → (n, n_out): used for efficient Hessian computation."""
         x_proj = x @ self._B
         x_enc  = torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
         return self.net(x_enc)
+
+    def forward(self, in_vars: dict) -> dict:
+        """Training graph contract dict → dict: called every step by graph.py."""
+        x = torch.cat([in_vars[k] for k in self._in_keys], dim=-1)
+        out = self._tensor_forward(x)
+        return {k: out[:, i : i + 1] for i, k in enumerate(self._out_keys)}
 
 
 # =============================================================================
