@@ -109,8 +109,54 @@ from sympy import Symbol, Function, diff
 # =============================================================================
 # physicsnemo uses duck-typed geometry objects.  The constraints call
 # geometry.sample_interior() and geometry.sample_boundary(); no base-class
-# inheritance is required.  Parameterization variables (e.g. t) are injected
-# by the constraint framework after the geometry returns spatial coordinates.
+# inheritance is required.
+#
+# IMPORTANT — Parameterization contract:
+#   PhysicsNeMo passes a Parameterization object (or a plain dict) to both
+#   sample_interior and sample_boundary via the ``parameterization`` keyword.
+#   The geometry is responsible for sampling those parameters (e.g. t) and
+#   returning them inside the result dict.  If t is absent the constraint
+#   graph will raise a silent KeyError during training setup.
+#
+#   _sample_params() below handles this regardless of whether the caller
+#   passes a Parameterization object, a plain {Symbol: (lo,hi)} dict, or None.
+
+
+def _sample_params(n: int, parameterization=None) -> dict:
+    """
+    Sample parameterization variables (e.g. t) and return them as a dict
+    suitable for merging into a geometry result dict.
+
+    Handles:
+      - None                      → empty dict
+      - Parameterization object   → call .sample(n) (physicsnemo native)
+      - plain dict                → {Symbol/str: (lo, hi) or scalar}
+    """
+    if parameterization is None:
+        return {}
+
+    # PhysicsNeMo Parameterization object with a .sample() method
+    if hasattr(parameterization, "sample"):
+        try:
+            samples = parameterization.sample(n)
+            # .sample() returns {str: ndarray}, ensure shape (n, 1)
+            return {
+                k: (v if v.ndim == 2 else v[:, None]).astype(np.float32)
+                for k, v in samples.items()
+            }
+        except Exception:
+            pass  # fall through to dict-style handling
+
+    # Plain dict: {Symbol("t"): (lo, hi)}  or  {Symbol("t"): scalar}
+    out: dict = {}
+    for key, val in parameterization.items():
+        name = key.name if hasattr(key, "name") else str(key)
+        if isinstance(val, (tuple, list)) and len(val) == 2:
+            lo, hi = float(val[0]), float(val[1])
+            out[name] = np.random.uniform(lo, hi, (n, 1)).astype(np.float32)
+        else:
+            out[name] = np.full((n, 1), float(val), dtype=np.float32)
+    return out
 
 class HollowEllipticalConeShell:
     """
@@ -124,6 +170,8 @@ class HollowEllipticalConeShell:
     Shell material: inside outer cone AND outside inner cone AND z in [Z_BOTTOM, Z_TOP].
     Apex at z = H_CONE = Z_TOP (full cone, not truncated frustum).
     """
+
+    dims: int = 3   # spatial dimensionality — required by some physicsnemo internals
 
     def __init__(
         self,
@@ -299,9 +347,8 @@ class HollowEllipticalConeShell:
     ) -> dict:
         """
         Rejection sampling inside the shell bounding box, filtered to shell material.
-
-        Returns spatial coordinates only; the constraint framework appends
-        parameterization variables (e.g. t) independently.
+        Parameterization variables (e.g. t) are sampled via _sample_params and
+        returned in the same dict so the constraint graph can resolve them.
         """
         pts_x: list = []
         pts_y: list = []
@@ -325,12 +372,14 @@ class HollowEllipticalConeShell:
         x = np.concatenate(pts_x)[:nr_points, None]
         y = np.concatenate(pts_y)[:nr_points, None]
         z = np.concatenate(pts_z)[:nr_points, None]
-        return {
+        result = {
             "x":   x,
             "y":   y,
             "z":   z,
             "sdf": np.zeros_like(x),
         }
+        result.update(_sample_params(nr_points, parameterization))
+        return result
 
     def sample_boundary(
         self,
@@ -357,7 +406,9 @@ class HollowEllipticalConeShell:
         bottom = self._sample_bottom_lip(n_bottom)
 
         keys = ["x", "y", "z", "normal_x", "normal_y", "normal_z", "area", "sdf"]
-        return {k: np.concatenate([outer[k], inner[k], bottom[k]], axis=0) for k in keys}
+        result = {k: np.concatenate([outer[k], inner[k], bottom[k]], axis=0) for k in keys}
+        result.update(_sample_params(nr_points, parameterization))
+        return result
 
 
 class OuterConeWall:
@@ -366,15 +417,21 @@ class OuterConeWall:
     All batch_size points are drawn from this surface — no criteria lambda needed.
     """
 
+    dims: int = 3
+
     def __init__(self, cone_shell: HollowEllipticalConeShell) -> None:
         self._cs = cone_shell
 
-    def sample_boundary(self, nr_points: int, **kwargs) -> dict:
-        return self._cs._sample_outer_wall(nr_points)
+    def sample_boundary(self, nr_points: int, parameterization=None, **kwargs) -> dict:
+        result = self._cs._sample_outer_wall(nr_points)
+        result.update(_sample_params(nr_points, parameterization))
+        return result
 
-    def sample_interior(self, nr_points: int, **kwargs) -> dict:
+    def sample_interior(self, nr_points: int, parameterization=None, **kwargs) -> dict:
         # Fallback: return boundary samples (used if framework probes this method)
-        return self._cs._sample_outer_wall(nr_points)
+        result = self._cs._sample_outer_wall(nr_points)
+        result.update(_sample_params(nr_points, parameterization))
+        return result
 
 
 class InnerConeWall:
@@ -382,14 +439,20 @@ class InnerConeWall:
     Boundary-only geometry: inner slanted cone surface (adiabatic Neumann wall).
     """
 
+    dims: int = 3
+
     def __init__(self, cone_shell: HollowEllipticalConeShell) -> None:
         self._cs = cone_shell
 
-    def sample_boundary(self, nr_points: int, **kwargs) -> dict:
-        return self._cs._sample_inner_wall(nr_points)
+    def sample_boundary(self, nr_points: int, parameterization=None, **kwargs) -> dict:
+        result = self._cs._sample_inner_wall(nr_points)
+        result.update(_sample_params(nr_points, parameterization))
+        return result
 
-    def sample_interior(self, nr_points: int, **kwargs) -> dict:
-        return self._cs._sample_inner_wall(nr_points)
+    def sample_interior(self, nr_points: int, parameterization=None, **kwargs) -> dict:
+        result = self._cs._sample_inner_wall(nr_points)
+        result.update(_sample_params(nr_points, parameterization))
+        return result
 
 
 class BottomAnnularLip:
@@ -397,14 +460,20 @@ class BottomAnnularLip:
     Boundary-only geometry: bottom annular ring at z=Z_BOTTOM (adiabatic Neumann).
     """
 
+    dims: int = 3
+
     def __init__(self, cone_shell: HollowEllipticalConeShell) -> None:
         self._cs = cone_shell
 
-    def sample_boundary(self, nr_points: int, **kwargs) -> dict:
-        return self._cs._sample_bottom_lip(nr_points)
+    def sample_boundary(self, nr_points: int, parameterization=None, **kwargs) -> dict:
+        result = self._cs._sample_bottom_lip(nr_points)
+        result.update(_sample_params(nr_points, parameterization))
+        return result
 
-    def sample_interior(self, nr_points: int, **kwargs) -> dict:
-        return self._cs._sample_bottom_lip(nr_points)
+    def sample_interior(self, nr_points: int, parameterization=None, **kwargs) -> dict:
+        result = self._cs._sample_bottom_lip(nr_points)
+        result.update(_sample_params(nr_points, parameterization))
+        return result
 
 
 # =============================================================================
@@ -688,6 +757,22 @@ cs.store(name="config", node=PhysicsNeMoConfig)
 
 @hydra.main(version_base="1.2", config_path=None, config_name="config")
 def run(cfg: SimConfig) -> None:
+    import traceback as _tb
+    try:
+        _run_inner(cfg)
+    except Exception as _exc:
+        # Hydra captures stdout/stderr; this guarantees the full traceback is
+        # visible even when running as a subprocess in Kaggle.
+        print(f"\n[FATAL] Training crashed: {_exc}", flush=True)
+        _tb.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        raise
+
+
+def _run_inner(cfg: SimConfig) -> None:
+
+    print("[Stratos PINN v4] Starting training setup …", flush=True)
 
     # --- Training hyperparameters --------------------------------------------
     with open_dict(cfg):
@@ -880,6 +965,9 @@ def run(cfg: SimConfig) -> None:
     loss_cfg = LossConf()
     loss_cfg._target_ = "physicsnemo.sym.loss.aggregator.Sum"
     cfg.loss = loss_cfg
+
+    print("[Stratos PINN v4] All constraints built — launching solver …", flush=True)
+    sys.stdout.flush()
 
     # Expected convergence:
     #   - Outer-wall Dirichlet loss → ~0 within  5 000 steps  (weight = 10)
